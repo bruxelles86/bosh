@@ -23,7 +23,6 @@ var _ = Describe("Bosh Backup and Restore BBR", func() {
 
 	BeforeEach(func() {
 		startInnerBoshOptions = []string{fmt.Sprintf("-o %s", boshDeploymentAssetPath("bbr.yml"))}
-
 	})
 
 	JustBeforeEach(func() {
@@ -210,83 +209,87 @@ var _ = Describe("Bosh Backup and Restore BBR", func() {
 			})
 		})
 
-		Context("tls configuration", func() {
-			BeforeEach(func() {
-				external_db_host := assertEnvExists("RDS_MYSQL_EXTERNAL_DB_HOST")
-				external_db_user := assertEnvExists("RDS_MYSQL_EXTERNAL_DB_USER")
-				external_db_password := assertEnvExists("RDS_MYSQL_EXTERNAL_DB_PASSWORD")
-				external_db_name := assertEnvExists("RDS_MYSQL_EXTERNAL_DB_NAME")
+		FContext("TLS configuration", func() {
+			backUpAndRestores := func() {
+				It("backs up and restores", func() {
+					syslogManifestPath := assetPath("syslog-manifest.yml")
+					uploadStemcell(candidateWardenLinuxStemcellPath)
 
-				connectionOptions := "external_db/rds_mysql_connection_options.yml"
-				connectionVarFile := "external_db/rds_mysql.yml"
-				cleanupMysqlDB(external_db_host, external_db_user, external_db_password, external_db_name, connectionVarFile)
+					By("create syslog deployment", func() {
+						uploadRelease("https://bosh.io/d/github.com/cloudfoundry/syslog-release?v=11")
 
-				startInnerBoshOptions = append(startInnerBoshOptions,
-					"-o", boshDeploymentAssetPath("misc/external-db.yml"),
-					"-o", boshDeploymentAssetPath("experimental/db-enable-tls.yml"),
-					"-o", assetPath(connectionOptions),
-					"--vars-file", assetPath(connectionVarFile),
-					"-v", fmt.Sprintf("external_db_host=%s", external_db_host),
-					"-v", fmt.Sprintf("external_db_user=%s", external_db_user),
-					"-v", fmt.Sprintf("external_db_password=%s", external_db_password),
-					"-v", fmt.Sprintf("external_db_name=%s", external_db_name),
-				)
+						session := bosh("-n", "deploy", syslogManifestPath,
+							"-d", "syslog-deployment",
+							"-v", fmt.Sprintf("stemcell-os=%s", stemcellOS),
+						)
+						Eventually(session, 5*time.Minute).Should(gexec.Exit(0))
+					})
+
+					By("creating a backup", func() {
+						session := bbr("director",
+							"--host", fmt.Sprintf("%s:22", innerDirectorIP),
+							"--username", innerDirectorUser,
+							"--private-key-path", innerBoshJumpboxPrivateKeyPath,
+							"backup")
+						Eventually(session, 2*time.Minute).Should(gexec.Exit(0))
+					})
+
+					By("deleting the deployment (whoops)", func() {
+						session := bosh("-n", "delete-deployment", "-d", "syslog-deployment", "--force")
+						Eventually(session, 3*time.Minute).Should(gexec.Exit(0))
+					})
+
+					By("restore inner director from backup", func() {
+						var err error
+						backupDir, err = filepath.Glob(fmt.Sprintf("%s_*", innerDirectorIP))
+						Expect(err).NotTo(HaveOccurred())
+						Expect(backupDir).To(HaveLen(1))
+
+						session := bbr("director",
+							"--host", fmt.Sprintf("%s:22", innerDirectorIP),
+							"--username", innerDirectorUser,
+							"--private-key-path", innerBoshJumpboxPrivateKeyPath,
+							"restore",
+							"--artifact-path", backupDir[0])
+						Eventually(session, 2*time.Minute).Should(gexec.Exit(0))
+
+						waitForBoshDirectorUp(boshBinaryPath)
+					})
+
+					By("verifying that the deployment still exists", func() {
+						session := bosh("-n", "deployments")
+						Eventually(session, time.Minute).Should(gexec.Exit(0))
+						Eventually(session).Should(gbytes.Say("syslog-deployment"))
+					})
+				})
+			}
+
+			FContext("RDS", func() {
+				BeforeEach(func() {
+					dbConfig := loadExternalDBConfig("rds_mysql", false)
+
+					cleanupMysqlDB(dbConfig)
+					startInnerBoshOptions = append(
+						startInnerBoshOptions,
+						innerBoshWithExternalDBOptions(dbConfig)...,
+					)
+				})
+
+				backUpAndRestores()
 			})
 
-			It("works with tls to mysql on RDS", func() {
-				syslogManifestPath := assetPath("syslog-manifest.yml")
-				uploadStemcell(candidateWardenLinuxStemcellPath)
+			Context("Google Cloud SQL", func() {
+				BeforeEach(func() {
+					dbConfig := loadExternalDBConfig("gcp_mysql", true)
 
-				By("create syslog deployment", func() {
-					uploadStemcell(candidateWardenLinuxStemcellPath)
-					uploadRelease("https://bosh.io/d/github.com/cloudfoundry/syslog-release?v=11")
-
-					session := bosh("-n", "deploy", syslogManifestPath,
-						"-d", "syslog-deployment",
-						"-v", fmt.Sprintf("stemcell-os=%s", stemcellOS),
+					cleanupMysqlDB(dbConfig)
+					startInnerBoshOptions = append(
+						startInnerBoshOptions,
+						innerBoshWithExternalDBOptions(dbConfig)...,
 					)
-					Eventually(session, 3*time.Minute).Should(gexec.Exit(0))
 				})
 
-				By("creating a backup", func() {
-					session := bbr("director",
-						"--host", fmt.Sprintf("%s:22", innerDirectorIP),
-						"--username", innerDirectorUser,
-						"--private-key-path", innerBoshJumpboxPrivateKeyPath,
-						"backup")
-					Eventually(session, 2*time.Minute).Should(gexec.Exit(0))
-				})
-
-				By("deleting the deployment (whoops)", func() {
-					session := bosh("-n", "delete-deployment", "-d", "syslog-deployment", "--force")
-					Eventually(session, 3*time.Minute).Should(gexec.Exit(0))
-
-					session = bosh("-n", "clean-up", "--all")
-					Eventually(session, 3*time.Minute).Should(gexec.Exit(0))
-				})
-
-				By("restore inner director from backup", func() {
-					var err error
-					backupDir, err = filepath.Glob(fmt.Sprintf("%s_*", innerDirectorIP))
-					Expect(err).NotTo(HaveOccurred())
-					Expect(backupDir).To(HaveLen(1))
-
-					session := bbr("director",
-						"--host", fmt.Sprintf("%s:22", innerDirectorIP),
-						"--username", innerDirectorUser,
-						"--private-key-path", innerBoshJumpboxPrivateKeyPath,
-						"restore",
-						"--artifact-path", backupDir[0])
-					Eventually(session, 2*time.Minute).Should(gexec.Exit(0))
-
-					waitForBoshDirectorUp(boshBinaryPath)
-				})
-
-				By("verifying that the deployment still exists", func() {
-					session := bosh("-n", "deployments")
-					Eventually(session, time.Minute).Should(gexec.Exit(0))
-					Eventually(session).Should(gbytes.Say("syslog-deployment"))
-				})
+				backUpAndRestores()
 			})
 		})
 	})

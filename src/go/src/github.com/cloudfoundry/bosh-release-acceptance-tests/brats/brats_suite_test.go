@@ -2,7 +2,9 @@ package brats_test
 
 import (
 	"io/ioutil"
+	"log"
 	"os"
+	"strings"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -154,30 +156,112 @@ func uploadRelease(releaseUrl string) {
 	Eventually(session, 2*time.Minute).Should(gexec.Exit(0))
 }
 
-func cleanupMysqlDB(host, user, password, dbName, caFilePath string) {
-	out, err := exec.Command(outerBoshBinaryPath, "int", assetPath(caFilePath), "--path", "/db_ca").Output()
+type ExternalDBConfig struct {
+	Host     string
+	User     string
+	Password string
+	DBName   string
+
+	ClientCert string
+	ClientKey  string
+
+	ConnectionVarFile     string
+	ConnectionOptionsFile string
+}
+
+func loadExternalDBConfig(databaseType string, mutualTLSEnabled bool) ExternalDBConfig {
+	config := ExternalDBConfig{
+		Host:                  assertEnvExists(fmt.Sprintf("%s_EXTERNAL_DB_HOST", strings.ToUpper(databaseType))),
+		User:                  assertEnvExists(fmt.Sprintf("%s_EXTERNAL_DB_USER", strings.ToUpper(databaseType))),
+		Password:              assertEnvExists(fmt.Sprintf("%s_EXTERNAL_DB_PASSWORD", strings.ToUpper(databaseType))),
+		DBName:                assertEnvExists(fmt.Sprintf("%s_EXTERNAL_DB_NAME", strings.ToUpper(databaseType))),
+		ConnectionVarFile:     fmt.Sprintf("external_db/%s.yml", databaseType),
+		ConnectionOptionsFile: fmt.Sprintf("external_db/%s_connection_options.yml", databaseType),
+	}
+
+	if mutualTLSEnabled {
+		config.ClientCert = assertEnvExists(fmt.Sprintf("%s_EXTERNAL_DB_CLIENT_CERTIFICATE", strings.ToUpper(databaseType)))
+		config.ClientKey = assertEnvExists(fmt.Sprintf("%s_EXTERNAL_DB_CLIENT_PRIVATE_KEY", strings.ToUpper(databaseType)))
+	}
+
+	return config
+}
+
+func cleanupMysqlDB(dbConfig ExternalDBConfig) {
+	out, err := exec.Command(outerBoshBinaryPath, "int", assetPath(dbConfig.ConnectionVarFile), "--path", "/db_ca").Output()
 	Expect(err).ToNot(HaveOccurred())
 
-	tmpFile, err := ioutil.TempFile("", "db_ca")
+	tmpCertDir, err := ioutil.TempDir("", "bosh_db_tls")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer os.RemoveAll(tmpCertDir)
+
+	caFile, err := ioutil.TempFile(tmpCertDir, "db_ca")
 	Expect(err).ToNot(HaveOccurred())
 
-	defer os.Remove(tmpFile.Name())
-
-	_, err = tmpFile.Write(out)
-	Expect(err).ToNot(HaveOccurred())
-	err = tmpFile.Close()
+	defer caFile.Close()
+	_, err = caFile.Write(out)
 	Expect(err).ToNot(HaveOccurred())
 
-	session := execCommand(
-		"mysql",
+	args := []string{
 		"-h",
-		host,
-		fmt.Sprintf("--user=%s", user),
-		fmt.Sprintf("--password=%s", password),
-		fmt.Sprintf("--ssl-ca=%s", tmpFile.Name()),
-		"--ssl-mode=VERIFY_IDENTITY",
+		dbConfig.Host,
+		fmt.Sprintf("--user=%s", dbConfig.User),
+		fmt.Sprintf("--password=%s", dbConfig.Password),
 		"-e",
-		fmt.Sprintf("drop database %s; create database %s;", dbName, dbName),
-	)
+		fmt.Sprintf("drop database %s; create database %s;", dbConfig.DBName, dbConfig.DBName),
+		fmt.Sprintf("--ssl-ca=%s", caFile.Name()),
+	}
+
+	if dbConfig.ClientCert != "" || dbConfig.ClientKey != "" {
+		clientCertFile, err := ioutil.TempFile(tmpCertDir, "client_cert")
+		Expect(err).ToNot(HaveOccurred())
+
+		defer clientCertFile.Close()
+		_, err = clientCertFile.Write([]byte(dbConfig.ClientCert))
+		Expect(err).ToNot(HaveOccurred())
+
+		clientKeyFile, err := ioutil.TempFile(tmpCertDir, "client_key")
+		Expect(err).ToNot(HaveOccurred())
+
+		defer clientKeyFile.Close()
+		_, err = clientKeyFile.Write([]byte(dbConfig.ClientKey))
+		Expect(err).ToNot(HaveOccurred())
+
+		args = append(args,
+			fmt.Sprintf("--ssl-cert=%s", clientCertFile.Name()),
+			fmt.Sprintf("--ssl-key=%s", clientKeyFile.Name()),
+			"--ssl-mode=VERIFY_CA",
+		)
+	} else {
+		args = append(args, "--ssl-mode=VERIFY_IDENTITY")
+	}
+
+	session := execCommand("mysql", args...)
 	Eventually(session, 2*time.Minute).Should(gexec.Exit(0))
+}
+
+func innerBoshWithExternalDBOptions(dbConfig ExternalDBConfig) []string {
+	options := []string{
+		"-o", boshDeploymentAssetPath("misc/external-db.yml"),
+		"-o", boshDeploymentAssetPath("experimental/db-enable-tls.yml"),
+		"-o", assetPath(dbConfig.ConnectionOptionsFile),
+		"--vars-file", assetPath(dbConfig.ConnectionVarFile),
+		"-v", fmt.Sprintf("external_db_host=%s", dbConfig.Host),
+		"-v", fmt.Sprintf("external_db_user=%s", dbConfig.User),
+		"-v", fmt.Sprintf("external_db_password=%s", dbConfig.Password),
+		"-v", fmt.Sprintf("external_db_name=%s", dbConfig.DBName),
+	}
+
+	if dbConfig.ClientCert != "" || dbConfig.ClientKey != "" {
+		options = append(options,
+			fmt.Sprintf("-o %s", boshDeploymentAssetPath("experimental/db-enable-mutual-tls.yml")),
+			"-v", fmt.Sprintf("db_client_certificate=%s", dbConfig.ClientCert),
+			"-v", fmt.Sprintf("db_client_private_key=%s", dbConfig.ClientKey),
+		)
+	}
+
+	return options
 }
