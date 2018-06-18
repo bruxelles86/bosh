@@ -22,6 +22,11 @@ class DBMigrator
   def migrator(database, directory, options)
     return unless database && directory && File.directory?(directory)
 
+    puts "INSIDE MIGRATOR METHOD"
+    puts "DATABASE: " + database
+    puts "DIRECTORY: " + directory
+    puts "options: " + options
+
     Sequel.extension :migration
     Sequel::TimestampMigrator.new(database, directory, options)
   end
